@@ -66,6 +66,7 @@ static volatile uint32_t dropped_frames = 0;    /* overruns, for debugging   */
 static volatile uint32_t phase_inc[NNOTES];     /* oscillator step, per voice */
 static volatile uint8_t  gate[NNOTES];          /* key held, per voice      */
 static volatile uint8_t  wave         = 0;      /* 0 saw 1 square 2 tri 3 sine */
+static volatile uint8_t quantise = 0;         /* nearest equal-tempered semitone */
 static volatile int32_t  lp_k         = 32767;  /* filter coefficient Q15   */
 
 #define ENV_MAX     (32767 * 32768)             /* Q30, converts to Q15 32767 */
@@ -170,7 +171,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         uint8_t keys = 0;
         for (int v = 0; v < NNOTES; v++) keys |= gate[v] << v;
         fr->keys = keys;
-        fr->wave = wave;
+        fr->wave = wave | (quantise ? 0x80 : 0);
 
         uint8_t next = fill_buf ^ 1;
         if (tx_buf == (int8_t)next) {
@@ -209,6 +210,8 @@ static void control_update(void)
         if (HAL_GPIO_ReadPin(port[i], pin[i]) == GPIO_PIN_RESET) {
             /* each note's pot sweeps 4 octaves, 55 Hz .. 880 Hz, exponential */
             float f = 55.0f * exp2f(pots[i] * (4.0f / 4095.0f));
+            if (quantise)
+                f = 55.0f * exp2f(roundf(pots[i] * (48.0f / 4095.0f)) / 12.0f);
             phase_inc[i] = (uint32_t)(f * (4294967296.0f / FS));
             gate[i] = 1;
         } else {
@@ -257,6 +260,13 @@ void synth_init(void)
 
 void synth_loop(void)
 {
+    /* Explicit on/off commands make repeated requests safe. */
+    uint8_t command;
+    if (HAL_UART_Receive(&huart2, &command, 1, 0) == HAL_OK) {
+        if (command == 'Q') quantise = 1;
+        if (command == 'q') quantise = 0;
+    }
+
     if (tx_buf < 0 && ready_buf >= 0) {
         /* claim the frame atomically so the ISR can't swap into it between
            reading ready_buf and marking it DMA-owned */

@@ -111,7 +111,9 @@ def parse(buf: bytearray, stats: dict, ctrl: dict):
                       .astype(np.float32) / 32768.0)
         ctrl["pots"] = np.frombuffer(bytes(buf[AUDIO_END:FRAME - 2]),
                                      dtype="<u2").tolist()
-        ctrl["keys"], ctrl["wave"] = buf[FRAME - 2], buf[FRAME - 1]
+        ctrl["keys"] = buf[FRAME - 2]
+        ctrl["wave"] = buf[FRAME - 1] & 3
+        ctrl["quantise"] = bool(buf[FRAME - 1] & 0x80)
         del buf[:FRAME]
     return blocks
 
@@ -157,7 +159,9 @@ def note_name(f):
 
 # Pot -> parameter mappings. These mirror control_update() in synth_core.c
 # and must be kept in step with it.
-def pot_pitch(p):
+def pot_pitch(p, quantise=False):
+    if quantise:
+        return 55.0 * 2 ** (np.floor(p * 48.0 / 4095.0 + 0.5) / 12.0)
     return 55.0 * 2 ** (p * 4.0 / 4095.0)
 
 
@@ -207,7 +211,10 @@ def control_labels(ctrl, rate, note_pots=None):
     pots, keys = ctrl["pots"], ctrl["keys"]
     cells = []
     for i in range(4):
-        f = pot_pitch(pots[i] if note_pots is None else note_pots[i])
+        quantise = ctrl.get("quantise", False)
+        # Quantised labels use the same raw reading as the firmware.
+        p = pots[i] if quantise or note_pots is None else note_pots[i]
+        f = pot_pitch(p, quantise)
         cells.append((f"NOTE {i + 1}", f"{f:.1f} Hz\n{note_name(f)}",
                       bool(keys >> i & 1)))
     fc = pot_cutoff(pots[4], rate)
@@ -227,7 +234,7 @@ def control_labels(ctrl, rate, note_pots=None):
     return cells
 
 
-def run_scope(scope, stats, q, rate, ctrl):
+def run_scope(scope, stats, q, rate, ctrl, commands):
     """Oscilloscope window: triggered waveform + detected pitch, and a panel
     showing each control's current value. Blocks."""
     import tkinter as tk
@@ -242,10 +249,11 @@ def run_scope(scope, stats, q, rate, ctrl):
     cells = []
     for col in range(NPOTS + 1):
         panel.columnconfigure(col, weight=1, uniform="cell")
+        # Keep panel width stable when control values change.
         name = tk.Label(panel, bg="#000000", fg="#666666",
-                        font=("Consolas", 9))
+                        font=("Consolas", 9), width=10)
         value = tk.Label(panel, bg="#000000", fg="#888888", justify="center",
-                         font=("Consolas", 12), text="—\n ")
+                         font=("Consolas", 12), width=10, text="—\n ")
         name.grid(row=0, column=col, pady=(8, 0))
         value.grid(row=1, column=col, pady=(2, 10))
         cells.append((name, value))
@@ -265,7 +273,7 @@ def run_scope(scope, stats, q, rate, ctrl):
                               font=("Consolas", 9), text="I - info",
                               tags="text")
     view = {"gain": 1.0, "cycles": 3, "info": False, "theme": 0,
-            "grid_size": None, "restack": False}
+            "grid_size": None, "restack": False, "quantise": False}
 
     # line pools for the beam-speed layers: one item per run of slow trace,
     # created as needed and hidden when unused
@@ -299,9 +307,18 @@ def run_scope(scope, stats, q, rate, ctrl):
     root.bind("<Key-r>", lambda e: view.update(gain=1.0, cycles=3))
 
     def set_hint():
+        quantisation = "on" if ctrl.get("quantise", False) else "off"
         canvas.itemconfigure(
             hint, text="↑↓ - gain   ←→ - cycles   R - reset   T - theme   "
-                       "I - info" if view["info"] else "I - info")
+                       f"Q - quantise: {quantisation}   I - info" if view["info"]
+                       else "I - info")
+
+    def toggle_quantise(e):
+        view["quantise"] = not view["quantise"]
+        commands.append(b"Q" if view["quantise"] else b"q")
+
+    root.bind("<Key-q>", toggle_quantise)
+    root.bind("<Key-Q>", toggle_quantise)
 
     def toggle_info(e):
         view["info"] = not view["info"]
@@ -439,6 +456,7 @@ def run_scope(scope, stats, q, rate, ctrl):
                 name.configure(text=n)
                 value.configure(text=text, fg=theme["active"] if active
                                 else theme["value"])
+        set_hint()
         # Keep a 120 Hz schedule independent of redraw cost and timer lateness.
         # Skip missed deadlines so a stalled UI never queues catch-up redraws.
         next_redraw += redraw_interval
@@ -520,7 +538,7 @@ def main():
     dev_name = sd.query_devices(device, kind="output")["name"]
 
     port = args.port or find_port()
-    ser = serial.Serial(port, args.baud, timeout=0.05)
+    ser = serial.Serial(port, args.baud, timeout=0.05, write_timeout=0.1)
     print(f"Listening on {port} @ {args.baud} baud, {args.rate} Hz")
     print(f"Playing on {dev_name}")
 
@@ -529,10 +547,13 @@ def main():
     stats = {"resync": 0, "under": 0, "drop": 0, "frames": 0}
     ctrl = {}                                        # latest control state
     stop = threading.Event()
+    commands = collections.deque([b"q"])  # Start each session in continuous mode.
 
     def reader():
         buf = bytearray()
         while not stop.is_set():
+            while commands:
+                ser.write(commands.popleft())
             buf += ser.read(4096)
             for b in parse(buf, stats, ctrl):
                 q.append(b)
@@ -561,7 +582,7 @@ def main():
                              channels=1, dtype="float32", latency="low",
                              blocksize=BLOCK, callback=callback):
             if not args.no_scope:
-                run_scope(scope, stats, q, args.rate, ctrl)
+                run_scope(scope, stats, q, args.rate, ctrl, commands)
                 return
             while True:
                 time.sleep(1)
