@@ -1,5 +1,5 @@
 /*
- * synth_core.c - monophonic synth engine + serial audio streaming
+ * synth_core.c - 4-voice polyphonic synth engine + serial audio streaming
  * Target: NUCLEO-F446RE, STM32CubeIDE / HAL.
  *
  * ---- CubeMX setup -------------------------------------------------------
@@ -55,8 +55,8 @@ static volatile int8_t   tx_buf    = -1;        /* owned by UART DMA         */
 static volatile uint32_t dropped_frames = 0;    /* overruns, for debugging   */
 
 /* ---------------- parameters: control loop -> audio ISR ---------------- */
-static volatile uint32_t phase_inc    = 0;      /* oscillator step          */
-static volatile uint8_t  gate         = 0;      /* key held                 */
+static volatile uint32_t phase_inc[NNOTES];     /* oscillator step, per voice */
+static volatile uint8_t  gate[NNOTES];          /* key held, per voice      */
 static volatile uint8_t  wave         = 0;      /* 0 saw 1 square 2 tri 3 sine */
 static volatile int32_t  lp_k         = 32767;  /* filter coefficient Q15   */
 static volatile int32_t  release_step = 50;     /* env decrement per sample */
@@ -71,28 +71,35 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance != TIM6) return;
 
-    static uint32_t phase = 0;
-    static int32_t  env = 0, lp = 0;
+    static uint32_t phase[NNOTES];
+    static int32_t  env[NNOTES], lp = 0;
 
-    phase += phase_inc;
+    int32_t mix = 0;
+    for (int v = 0; v < NNOTES; v++) {
+        /* envelope: linear attack / adjustable linear release, Q15 */
+        if (gate[v]) { env[v] += ATTACK_STEP;  if (env[v] > 32767) env[v] = 32767; }
+        else         { env[v] -= release_step; if (env[v] < 0)     env[v] = 0;     }
+        if (env[v] == 0) continue;             /* silent voice: skip */
 
-    int32_t x;
-    switch (wave) {
-    case 0:  x = (int32_t)(phase >> 16) - 32768;                  break; /* saw    */
-    case 1:  x = (phase & 0x80000000u) ? 32767 : -32768;          break; /* square */
-    case 2: {int32_t t = (int32_t)(phase >> 15);                         /* tri    */
-             x = (t < 65536 ? t : 131071 - t) - 32768;}           break;
-    default: x = sine_lut[phase >> 24];                           break; /* sine   */
+        uint32_t p = phase[v] += phase_inc[v];
+
+        int32_t x;
+        switch (wave) {
+        case 0:  x = (int32_t)(p >> 16) - 32768;                      break; /* saw    */
+        case 1:  x = (p & 0x80000000u) ? 32767 : -32768;              break; /* square */
+        case 2: {int32_t t = (int32_t)(p >> 15);                             /* tri    */
+                 x = (t < 65536 ? t : 131071 - t) - 32768;}           break;
+        default: x = sine_lut[p >> 24];                               break; /* sine   */
+        }
+
+        mix += (x * env[v]) >> 15;
     }
+    mix >>= 2;                                 /* 4 voices at full scale fit */
 
-    /* envelope: linear attack / adjustable linear release, Q15 */
-    if (gate) { env += ATTACK_STEP;  if (env > 32767) env = 32767; }
-    else      { env -= release_step; if (env < 0)     env = 0;     }
+    /* one-pole low-pass, shared by all voices */
+    lp += ((mix - lp) * lp_k) >> 15;
 
-    /* one-pole low-pass */
-    lp += ((x - lp) * lp_k) >> 15;
-
-    int32_t out = ((lp * env) >> 15) >> 1;     /* -6 dB headroom */
+    int32_t out = lp;
 
     frames[fill_buf].s[fill_idx] = (int16_t)out;
     if (++fill_idx >= BLOCK) {
@@ -126,21 +133,19 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 /* ---------------- controls: ~500 Hz, outside the ISR ---------------- */
 static void control_update(void)
 {
-    /* --- buttons (active low). Lowest-numbered held button wins. --- */
+    /* --- buttons (active low), one voice each --- */
     static GPIO_TypeDef *const port[NNOTES] = { GPIOB, GPIOB, GPIOB, GPIOA };
     static const uint16_t      pin [NNOTES] = { GPIO_PIN_5, GPIO_PIN_4,
                                                 GPIO_PIN_10, GPIO_PIN_8 };
-    int note = -1;
-    for (int i = 0; i < NNOTES; i++)
-        if (HAL_GPIO_ReadPin(port[i], pin[i]) == GPIO_PIN_RESET) { note = i; break; }
-
-    if (note >= 0) {
-        /* each note's pot sweeps 4 octaves, 55 Hz .. 880 Hz, exponential */
-        float f = 55.0f * exp2f(pots[note] * (4.0f / 4095.0f));
-        phase_inc = (uint32_t)(f * (4294967296.0f / FS));
-        gate = 1;
-    } else {
-        gate = 0;      /* phase_inc kept so the release tail keeps its pitch */
+    for (int i = 0; i < NNOTES; i++) {
+        if (HAL_GPIO_ReadPin(port[i], pin[i]) == GPIO_PIN_RESET) {
+            /* each note's pot sweeps 4 octaves, 55 Hz .. 880 Hz, exponential */
+            float f = 55.0f * exp2f(pots[i] * (4.0f / 4095.0f));
+            phase_inc[i] = (uint32_t)(f * (4294967296.0f / FS));
+            gate[i] = 1;
+        } else {
+            gate[i] = 0;   /* phase_inc kept so the release tail keeps its pitch */
+        }
     }
 
     /* --- B1 cycles waveform on press --- */
