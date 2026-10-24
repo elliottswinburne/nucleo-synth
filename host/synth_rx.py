@@ -156,14 +156,14 @@ def run_scope(scope, stats, q, rate, ctrl):
     root.title("synth scope")
 
     # control panel along the bottom: one cell per pot, plus the waveform
-    panel = tk.Frame(root, bg="#111111")
+    panel = tk.Frame(root, bg="#000000")
     panel.pack(side="bottom", fill="x")
     cells = []
     for col in range(7):
         panel.columnconfigure(col, weight=1, uniform="cell")
-        name = tk.Label(panel, bg="#111111", fg="#666666",
+        name = tk.Label(panel, bg="#000000", fg="#666666",
                         font=("Consolas", 9))
-        value = tk.Label(panel, bg="#111111", fg="#888888", justify="center",
+        value = tk.Label(panel, bg="#000000", fg="#888888", justify="center",
                          font=("Consolas", 12, "bold"), text="—\n ")
         name.grid(row=0, column=col, pady=(8, 0))
         value.grid(row=1, column=col, pady=(2, 10))
@@ -177,12 +177,10 @@ def run_scope(scope, stats, q, rate, ctrl):
     pitch = canvas.create_text(16, 12, anchor="nw", fill="#ffffff",
                                font=("Consolas", 22, "bold"))
     info = canvas.create_text(16, 52, anchor="nw", fill="#888888",
-                              font=("Consolas", 10))
+                              font=("Consolas", 10), state="hidden")
     hint = canvas.create_text(0, 0, anchor="se", fill="#555555",
-                              font=("Consolas", 9),
-                              text="↑↓/wheel gain   "
-                                   "←→ cycles   R reset")
-    view = {"gain": 1.0, "cycles": 3}
+                              font=("Consolas", 9), text="I info")
+    view = {"gain": 1.0, "cycles": 3, "info": False}
 
     def zoom(gain=1.0, cycles=0):
         view["gain"] = min(max(view["gain"] * gain, 0.25), 32.0)
@@ -196,7 +194,20 @@ def run_scope(scope, stats, q, rate, ctrl):
     root.bind("<Right>", lambda e: zoom(cycles=1))
     root.bind("<Key-r>", lambda e: view.update(gain=1.0, cycles=3))
 
+    def toggle_info(e):
+        view["info"] = not view["info"]
+        canvas.itemconfigure(info, state="normal" if view["info"] else "hidden")
+        canvas.itemconfigure(
+            hint, text="↑↓/wheel gain   ←→ cycles   R reset   I info"
+            if view["info"] else "I info")
+
+    root.bind("<Key-i>", toggle_info)
+
+    redraw_interval = 1.0 / 120.0
+    next_redraw = time.perf_counter()
+
     def update():
+        nonlocal next_redraw
         w, h = max(canvas.winfo_width(), 2), canvas.winfo_height()
         blocks = list(scope)
         x = np.concatenate(blocks) if blocks else np.zeros(BLOCK, np.float32)
@@ -224,7 +235,7 @@ def run_scope(scope, stats, q, rate, ctrl):
         canvas.coords(hint, w - 10, h - 8)
 
         canvas.itemconfigure(
-            pitch, text=f"{f:6.1f} Hz   {note_name(f)}" if f else "—")
+            pitch, text=f"{f:.1f} Hz   {note_name(f)}" if f else "—")
         canvas.itemconfigure(
             info, text=f"{1000 * span / rate:.1f} ms across   "
                        f"gain x{view['gain']:.2g}   "
@@ -238,7 +249,15 @@ def run_scope(scope, stats, q, rate, ctrl):
                 name.configure(text=n)
                 value.configure(text=text,
                                 fg="#ffffff" if active else "#888888")
-        root.after(33, update)                         # ~30 fps
+        # Keep a 120 Hz schedule independent of redraw cost and timer lateness.
+        # Skip missed deadlines so a stalled UI never queues catch-up redraws.
+        next_redraw += redraw_interval
+        now = time.perf_counter()
+        if next_redraw <= now:
+            missed = int((now - next_redraw) / redraw_interval) + 1
+            next_redraw += missed * redraw_interval
+        delay_ms = max(1, int((next_redraw - now) * 1000 + 0.999))
+        root.after(delay_ms, update)
 
     def on_error(exc, val, tb):                        # let Ctrl+C quit
         if issubclass(exc, KeyboardInterrupt):
@@ -247,8 +266,18 @@ def run_scope(scope, stats, q, rate, ctrl):
             traceback.print_exception(exc, val, tb)
 
     root.report_callback_exception = on_error
-    update()
-    root.mainloop()
+    winmm = None
+    if sys.platform == "win32":
+        import ctypes
+        winmm = ctypes.WinDLL("winmm")
+        if winmm.timeBeginPeriod(1) != 0:
+            winmm = None
+    try:
+        update()
+        root.mainloop()
+    finally:
+        if winmm is not None:
+            winmm.timeEndPeriod(1)
 
 
 def find_port():
