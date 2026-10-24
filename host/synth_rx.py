@@ -157,6 +157,20 @@ def note_name(f):
     return f"{NOTE_NAMES[m % 12]}{m // 12 - 1} {100 * (midi - m):+.0f}¢"
 
 
+def fft_spectrum(x, rate):
+    """4096-point, Hann-windowed amplitude spectrum in dBFS (0 dB = peak 1)."""
+    nfft = 4096
+    samples = np.asarray(x[-nfft:], dtype=np.float64)
+    frequencies = np.fft.rfftfreq(nfft, 1.0 / rate)
+    if len(samples) < 3:
+        return frequencies, np.full(len(frequencies), -80.0)
+    window = np.hanning(len(samples))
+    magnitude = np.abs(np.fft.rfft(samples * window, nfft)) / window.sum()
+    magnitude[1:-1] *= 2
+    db = 20 * np.log10(np.maximum(magnitude, 1e-8))
+    return frequencies, np.clip(db, -80, 0)
+
+
 # Pot -> parameter mappings. These mirror control_update() in synth_core.c
 # and must be kept in step with it.
 def pot_pitch(p, quantise=False):
@@ -273,7 +287,8 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
                               font=("Consolas", 9), text="I - info",
                               tags="text")
     view = {"gain": 1.0, "cycles": 3, "info": False, "theme": 0,
-            "grid_size": None, "restack": False, "quantise": False}
+            "grid_size": None, "restack": False, "quantise": False,
+            "fft": False}
 
     # line pools for the beam-speed layers: one item per run of slow trace,
     # created as needed and hidden when unused
@@ -308,10 +323,19 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
 
     def set_hint():
         quantisation = "on" if ctrl.get("quantise", False) else "off"
+        scope_keys = "" if view["fft"] else "↑↓ - gain   ←→ - cycles   R - reset   "
         canvas.itemconfigure(
-            hint, text="↑↓ - gain   ←→ - cycles   R - reset   T - theme   "
-                       f"Q - quantise: {quantisation}   I - info" if view["info"]
+            hint, text=scope_keys + "T - theme   "
+                       f"F - FFT   Q - quantise: {quantisation}   I - info" if view["info"]
                        else "I - info")
+
+    def toggle_fft(e):
+        view["fft"] = not view["fft"]
+        view["grid_size"] = None
+        root.title("synth FFT" if view["fft"] else "synth scope")
+
+    root.bind("<Key-f>", toggle_fft)
+    root.bind("<Key-F>", toggle_fft)
 
     def toggle_quantise(e):
         view["quantise"] = not view["quantise"]
@@ -330,7 +354,7 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
     def draw_screen(w, h):
         """Graticule (10 x 8 divisions, minor ticks along the centre lines)
         and the bezel, for the current size and theme."""
-        canvas.delete("grid", "bezel")
+        canvas.delete("grid", "bezel", "scale")
         view["restack"] = True
         t = THEMES[view["theme"]]
         if t["bezel"] is not None:
@@ -347,6 +371,25 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
                                width=8, tags="bezel")
             canvas.create_line(0, h - 1, w, h - 1, fill=t["grid"],
                                width=1, tags="bezel")
+        if view["fft"]:
+            top, bottom = 80, max(81, h - 54)
+            left, right = 84, max(85, w - 12)
+            for i in range(5):
+                x = left + (right - left) * i / 4
+                hz = rate * i / 8
+                label = f"{hz / 1000:.1f} kHz" if hz >= 1000 else f"{hz:.0f} Hz"
+                anchor = "w" if i == 0 else "e" if i == 4 else "center"
+                canvas.create_text(x, bottom + 14,
+                                   text=label, anchor=anchor, fill=t["info"],
+                                   font=("Consolas", 9), tags=("scale", "text"))
+                y = top + (bottom - top) * i / 4
+                canvas.create_text(left - 12, y, text=f"{-20 * i} dBFS", anchor="e",
+                                   fill=t["info"], font=("Consolas", 9),
+                                   tags=("scale", "text"))
+                if t["grid"] is not None:
+                    canvas.create_line(x, top, x, bottom, fill=t["grid"], tags="grid")
+                    canvas.create_line(left, y, right, y, fill=t["grid"], tags="grid")
+            return
         if t["grid"] is None:
             return
         for i in range(11):
@@ -411,6 +454,13 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
         pts = np.empty(2 * w)
         pts[0::2] = np.arange(w)
         pts[1::2] = h / 2 - ys * (0.48 * h * view["gain"])  # x1: full scale
+        if view["fft"]:
+            frequencies, db = fft_spectrum(x, rate)
+            top, bottom = 80, max(81, h - 54)
+            left, right = 84, max(85, w - 12)
+            pts = np.empty(2 * len(db))
+            pts[0::2] = left + frequencies / (rate / 2) * (right - left)
+            pts[1::2] = top + (-db / 80) * (bottom - top)
         theme = THEMES[view["theme"]]
         # slope in px per px for each segment, smoothed so a slope sitting
         # near a threshold doesn't split a run into flickering pieces
@@ -438,13 +488,16 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
                     canvas.tag_raise(layer)
             view["restack"] = False
         canvas.coords(axis, 0, h / 2, w, h / 2)
+        canvas.itemconfigure(axis, state="hidden" if view["fft"] else "normal")
         canvas.coords(hint, w - 10, h - 8)
 
         canvas.itemconfigure(
             pitch, text=f"{f:.1f} Hz   {note_name(f)}" if f else "—")
+        view_info = (f"0–{rate / 2000:.2f} kHz   4096-point FFT   "
+                     if view["fft"] else
+                     f"{1000 * span / rate:.1f} ms across   gain x{view['gain']:.2g}   ")
         canvas.itemconfigure(
-            info, text=f"{1000 * span / rate:.1f} ms across   "
-                       f"gain x{view['gain']:.2g}   "
+            info, text=view_info +
                        f"frames {stats['frames']}  buffered {len(q)}  "
                        f"underruns {stats['under']}  drops {stats['drop']}  "
                        f"resyncs {stats['resync']}")
