@@ -39,6 +39,51 @@ SCOPE_BLOCKS = 32           # audio kept for the scope: 32 x 256 = ~371 ms
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 WAVES = ["SAW", "SQUARE", "TRIANGLE", "SINE"]
 
+# scope colour themes, cycled with T. None leaves that element out.
+#   trace: the whole trace. With beam set, this is the dim colour of the
+#          fast-moving parts, and beam (mid, bright) is drawn over the slower
+#          parts, like a CRT whose brightness falls with beam speed
+#   glow:  halo colours, widest first: the outer two under the mid parts,
+#          the innermost under the bright parts (steps fake a soft falloff,
+#          since Tk lines aren't anti-aliased)
+#   grid:  graticule colour.  bezel: frame and rounded screen corners
+#   panel: background of the control panel below the screen
+THEMES = [
+    {"bg": "#000000", "panel": "#000000", "trace": "#ffffff", "beam": None,
+     "glow": None, "axis": "#333333", "grid": None, "bezel": None,
+     "pitch": "#ffffff", "info": "#888888", "hint": "#555555",
+     "label": "#666666", "value": "#888888", "active": "#ffffff"},
+    # vintage: green P31 phosphor CRT
+    {"bg": "#020b05", "panel": "#020b05", "trace": "#2b7343",
+     "beam": ("#6fdc8f", "#d2ffdc"),
+     "glow": ("#06200e", "#0c3519", "#1a5c2e"),
+     "axis": "#1c5a2e", "grid": "#0d2e18", "bezel": "#0c0e0d",
+     "pitch": "#59ff8c", "info": "#2f9a52", "hint": "#1f6b38",
+     "label": "#2a8048", "value": "#3fae63", "active": "#a8ffc0"},
+]
+BEAM_SLOW = (4.0, 1.2)      # px of rise per px across: mid, bright below this
+# canvas stacking order, bottom to top
+LAYERS = ["grid", "axis", "glow_wide", "glow_mid", "glow_hi", "trace",
+          "beam_mid", "beam_hi", "bezel", "text"]
+
+
+def runs(mask, min_len=2):
+    """(first, last) point indices of each run of >= min_len consecutive
+    True segments; segment i joins points i and i+1."""
+    edges = np.diff(np.concatenate(([0], mask.astype(np.int8), [0])))
+    starts, ends = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+    keep = ends - starts >= min_len
+    return list(zip(starts[keep].tolist(), ends[keep].tolist()))
+
+
+def thin(pts, step=4):
+    """Every step-th point of a flat [x0, y0, x1, y1, ...] list, keeping the
+    last point. For wide halos, which hide the detail anyway."""
+    out = [v for i in range(0, len(pts), 2 * step) for v in pts[i:i + 2]]
+    if (len(pts) - 2) % (2 * step):
+        out += pts[-2:]
+    return out
+
 
 def parse(buf: bytearray, stats: dict, ctrl: dict):
     """Pull complete, validated frames out of buf (modified in place).
@@ -164,7 +209,7 @@ def run_scope(scope, stats, q, rate, ctrl):
         name = tk.Label(panel, bg="#000000", fg="#666666",
                         font=("Consolas", 9))
         value = tk.Label(panel, bg="#000000", fg="#888888", justify="center",
-                         font=("Consolas", 12, "bold"), text="—\n ")
+                         font=("Consolas", 12), text="—\n ")
         name.grid(row=0, column=col, pady=(8, 0))
         value.grid(row=1, column=col, pady=(2, 10))
         cells.append((name, value))
@@ -172,15 +217,40 @@ def run_scope(scope, stats, q, rate, ctrl):
     canvas = tk.Canvas(root, width=800, height=360, bg="#000000",
                        highlightthickness=0)
     canvas.pack(fill="both", expand=True)
-    axis = canvas.create_line(0, 0, 0, 0, fill="#333333")
-    trace = canvas.create_line(0, 0, 0, 0, fill="#ffffff", width=2)
+    axis = canvas.create_line(0, 0, 0, 0, fill="#333333", tags="axis")
+    trace = canvas.create_line(0, 0, 0, 0, fill="#ffffff", width=2,
+                               tags="trace")
     pitch = canvas.create_text(16, 12, anchor="nw", fill="#ffffff",
-                               font=("Consolas", 22, "bold"))
-    info = canvas.create_text(16, 52, anchor="nw", fill="#888888",
-                              font=("Consolas", 10), state="hidden")
+                               font=("Consolas", 22), tags="text")
+    info = canvas.create_text(16, 48, anchor="nw", fill="#888888",
+                              font=("Consolas", 10), state="hidden",
+                              tags="text")
     hint = canvas.create_text(0, 0, anchor="se", fill="#555555",
-                              font=("Consolas", 9), text="I info")
-    view = {"gain": 1.0, "cycles": 3, "info": False}
+                              font=("Consolas", 9), text="I - info",
+                              tags="text")
+    view = {"gain": 1.0, "cycles": 3, "info": False, "theme": 0,
+            "grid_size": None, "restack": False}
+
+    # line pools for the beam-speed layers: one item per run of slow trace,
+    # created as needed and hidden when unused
+    widths = {"glow_wide": 11, "glow_mid": 7, "glow_hi": 5, "beam_mid": 2,
+              "beam_hi": 2}
+    pools = {layer: [] for layer in widths}
+    shown = dict.fromkeys(pools, 0)
+
+    def show_runs(layer, lines, colour):
+        pool = pools[layer]
+        while len(pool) < len(lines):
+            pool.append(canvas.create_line(0, 0, 0, 0, width=widths[layer],
+                                           capstyle="round",
+                                           joinstyle="round", tags=layer))
+            view["restack"] = True
+        for item, p in zip(pool, lines):
+            canvas.coords(item, *p)
+            canvas.itemconfigure(item, state="normal", fill=colour)
+        for item in pool[len(lines):shown[layer]]:
+            canvas.itemconfigure(item, state="hidden")
+        shown[layer] = len(lines)
 
     def zoom(gain=1.0, cycles=0):
         view["gain"] = min(max(view["gain"] * gain, 0.25), 32.0)
@@ -188,20 +258,77 @@ def run_scope(scope, stats, q, rate, ctrl):
 
     root.bind("<Up>", lambda e: zoom(gain=1.25))
     root.bind("<Down>", lambda e: zoom(gain=0.8))
-    root.bind("<MouseWheel>",
-              lambda e: zoom(gain=1.25 if e.delta > 0 else 0.8))
     root.bind("<Left>", lambda e: zoom(cycles=-1))
     root.bind("<Right>", lambda e: zoom(cycles=1))
     root.bind("<Key-r>", lambda e: view.update(gain=1.0, cycles=3))
 
+    def set_hint():
+        canvas.itemconfigure(
+            hint, text="↑↓ - gain   ←→ - cycles   R - reset   T - theme   "
+                       "I - info" if view["info"] else "I - info")
+
     def toggle_info(e):
         view["info"] = not view["info"]
         canvas.itemconfigure(info, state="normal" if view["info"] else "hidden")
-        canvas.itemconfigure(
-            hint, text="↑↓/wheel gain   ←→ cycles   R reset   I info"
-            if view["info"] else "I info")
+        set_hint()
 
     root.bind("<Key-i>", toggle_info)
+
+    def draw_screen(w, h):
+        """Graticule (10 x 8 divisions, minor ticks along the centre lines)
+        and the bezel, for the current size and theme."""
+        canvas.delete("grid", "bezel")
+        view["restack"] = True
+        t = THEMES[view["theme"]]
+        if t["bezel"] is not None:
+            r = 26                                  # screen corner radius
+            for cx, cy, a0, corner in ((r, r, 180, (0, 0)),
+                                       (w - r, r, 270, (w, 0)),
+                                       (w - r, h - r, 0, (w, h)),
+                                       (r, h - r, 90, (0, h))):
+                arc = [v for a in np.radians(np.linspace(a0, a0 + 90, 12))
+                       for v in (cx + r * np.cos(a), cy + r * np.sin(a))]
+                canvas.create_polygon(*corner, *arc, fill=t["bezel"],
+                                      outline="", tags="bezel")
+            canvas.create_line(0, h, 0, 0, w, 0, w, h, fill=t["bezel"],
+                               width=8, tags="bezel")
+            canvas.create_line(0, h - 1, w, h - 1, fill=t["grid"],
+                               width=1, tags="bezel")
+        if t["grid"] is None:
+            return
+        for i in range(11):
+            canvas.create_line(w * i / 10, 0, w * i / 10, h, tags="grid")
+        for i in range(9):
+            canvas.create_line(0, h * i / 8, w, h * i / 8, tags="grid")
+        for i in range(51):
+            x = w * i / 50
+            canvas.create_line(x, h / 2 - 4, x, h / 2 + 5, tags="grid")
+        for i in range(41):
+            y = h * i / 40
+            canvas.create_line(w / 2 - 4, y, w / 2 + 5, y, tags="grid")
+        canvas.itemconfigure("grid", fill=t["grid"])
+
+    def apply_theme():
+        t = THEMES[view["theme"]]
+        canvas.configure(bg=t["bg"])
+        for widget in (root, panel):
+            widget.configure(bg=t["panel"])
+        for name, value in cells:
+            name.configure(bg=t["panel"], fg=t["label"])
+            value.configure(bg=t["panel"], fg=t["value"])
+        for item, key in ((axis, "axis"), (trace, "trace"), (pitch, "pitch"),
+                          (info, "info"), (hint, "hint")):
+            canvas.itemconfigure(item, fill=t[key])
+        if t["beam"] is None:
+            for layer in pools:
+                show_runs(layer, [], "")
+        view["grid_size"] = None                    # redraw in the new colour
+
+    def cycle_theme(e):
+        view["theme"] = (view["theme"] + 1) % len(THEMES)
+        apply_theme()
+
+    root.bind("<Key-t>", cycle_theme)
 
     redraw_interval = 1.0 / 120.0
     next_redraw = time.perf_counter()
@@ -230,7 +357,32 @@ def run_scope(scope, stats, q, rate, ctrl):
         pts = np.empty(2 * w)
         pts[0::2] = np.arange(w)
         pts[1::2] = h / 2 - ys * (0.48 * h * view["gain"])  # x1: full scale
-        canvas.coords(trace, *pts.tolist())
+        theme = THEMES[view["theme"]]
+        # slope in px per px for each segment, smoothed so a slope sitting
+        # near a threshold doesn't split a run into flickering pieces
+        rise = np.abs(np.diff(pts[1::2]))
+        if len(rise) >= 5:
+            rise = np.convolve(rise, np.ones(5) / 5, mode="same")
+        pts = pts.tolist()
+        canvas.coords(trace, *pts)
+        if theme["beam"]:
+            mid, hi = ([pts[2 * a:2 * b + 2] for a, b in runs(rise < lim)]
+                       for lim in BEAM_SLOW)
+            # halos thinned: cheaper, and no knots from overlapping round joins
+            mid_halo, hi_halo = [thin(p) for p in mid], [thin(p) for p in hi]
+            show_runs("glow_wide", mid_halo, theme["glow"][0])
+            show_runs("glow_mid", mid_halo, theme["glow"][1])
+            show_runs("glow_hi", hi_halo, theme["glow"][2])
+            show_runs("beam_mid", mid, theme["beam"][0])
+            show_runs("beam_hi", hi, theme["beam"][1])
+        if view["grid_size"] != (w, h):
+            draw_screen(w, h)
+            view["grid_size"] = (w, h)
+        if view["restack"]:
+            for layer in LAYERS:
+                if canvas.find_withtag(layer):      # raise errors on no match
+                    canvas.tag_raise(layer)
+            view["restack"] = False
         canvas.coords(axis, 0, h / 2, w, h / 2)
         canvas.coords(hint, w - 10, h - 8)
 
@@ -247,8 +399,8 @@ def run_scope(scope, stats, q, rate, ctrl):
             for (name, value), (n, text, active) in zip(
                     cells, control_labels(ctrl, rate)):
                 name.configure(text=n)
-                value.configure(text=text,
-                                fg="#ffffff" if active else "#888888")
+                value.configure(text=text, fg=theme["active"] if active
+                                else theme["value"])
         # Keep a 120 Hz schedule independent of redraw cost and timer lateness.
         # Skip missed deadlines so a stalled UI never queues catch-up redraws.
         next_redraw += redraw_interval
