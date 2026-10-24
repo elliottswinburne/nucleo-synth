@@ -32,6 +32,7 @@
  * and declare:  void synth_init(void); void synth_loop(void);
  */
 #include "main.h"
+#include "sequencer.h"
 #include <math.h>
 #include <stdint.h>
 
@@ -51,9 +52,11 @@ typedef struct {
     uint16_t pots[NPOTS];  /* raw 12-bit ADC readings, for the host display */
     uint8_t  keys;         /* bit n set = note n+1 button held              */
     uint8_t  wave;
+    uint8_t  sequence;     /* bits 0-3: enabled steps, 4-5: playhead, 6: running */
+    uint8_t  bpm;
 } __attribute__((packed)) frame_t;
 
-_Static_assert(sizeof(frame_t) == 534, "Audio frame must match the host protocol");
+_Static_assert(sizeof(frame_t) == 536, "Audio frame must match the host protocol");
 
 static frame_t frames[2] = { { {0xA5, 0x5A}, {0} }, { {0xA5, 0x5A}, {0} } };
 static volatile uint8_t  fill_buf  = 0;
@@ -67,6 +70,10 @@ static volatile uint32_t phase_inc[NNOTES];     /* oscillator step, per voice */
 static volatile uint8_t  gate[NNOTES];          /* key held, per voice      */
 static volatile uint8_t  wave         = 0;      /* 0 saw 1 square 2 tri 3 sine */
 static volatile uint8_t quantise = 0;         /* nearest equal-tempered semitone */
+static volatile uint8_t sequence_running = 0;
+static volatile uint8_t sequence_enabled = 15;
+static volatile uint8_t sequence_bpm = 120;
+static sequencer_t sequencer;
 static volatile int32_t  lp_k         = 32767;  /* filter coefficient Q15   */
 
 #define ENV_MAX     (32767 * 32768)             /* Q30, converts to Q15 32767 */
@@ -137,8 +144,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     static int32_t lp = 0;
 
     int32_t mix = 0;
+    uint8_t sequence_gates = sequencer_tick(&sequencer, sequence_running,
+                                           sequence_bpm, sequence_enabled);
     for (int v = 0; v < NNOTES; v++) {
-        int32_t level = envelope_tick(&env[v], gate[v]);
+        uint8_t held = sequence_running ? (sequence_gates >> v) & 1 : gate[v];
+        int32_t level = envelope_tick(&env[v], held);
         if (level == 0) continue;             /* silent voice: skip */
 
         uint32_t p = phase[v] += phase_inc[v];
@@ -170,8 +180,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         for (int i = 0; i < NPOTS; i++) fr->pots[i] = pots[i];
         uint8_t keys = 0;
         for (int v = 0; v < NNOTES; v++) keys |= gate[v] << v;
+        if (sequence_running) keys = sequence_gates;
         fr->keys = keys;
         fr->wave = wave | (quantise ? 0x80 : 0);
+        fr->sequence = sequence_enabled | (sequencer.step << 4)
+                       | (sequence_running ? 0x40 : 0);
+        fr->bpm = sequence_bpm;
 
         uint8_t next = fill_buf ^ 1;
         if (tx_buf == (int8_t)next) {
@@ -206,14 +220,23 @@ static void control_update(void)
     static GPIO_TypeDef *const port[NNOTES] = { GPIOB, GPIOB, GPIOB, GPIOA };
     static const uint16_t      pin [NNOTES] = { GPIO_PIN_5, GPIO_PIN_4,
                                                 GPIO_PIN_10, GPIO_PIN_8 };
+    static uint8_t last[NNOTES], stable[NNOTES];
+    static uint32_t changed[NNOTES];
     for (int i = 0; i < NNOTES; i++) {
-        if (HAL_GPIO_ReadPin(port[i], pin[i]) == GPIO_PIN_RESET) {
+        uint8_t pressed = HAL_GPIO_ReadPin(port[i], pin[i]) == GPIO_PIN_RESET;
+        uint32_t tick = HAL_GetTick();
+        if (pressed != last[i]) { last[i] = pressed; changed[i] = tick; }
+        if (pressed != stable[i] && tick - changed[i] >= 20) {
+            stable[i] = pressed;
+            if (pressed && sequence_running) sequence_enabled ^= 1u << i;
+        }
+        if (sequence_running || stable[i]) {
             /* each note's pot sweeps 4 octaves, 55 Hz .. 880 Hz, exponential */
             float f = 55.0f * exp2f(pots[i] * (4.0f / 4095.0f));
             if (quantise)
                 f = 55.0f * exp2f(roundf(pots[i] * (48.0f / 4095.0f)) / 12.0f);
             phase_inc[i] = (uint32_t)(f * (4294967296.0f / FS));
-            gate[i] = 1;
+            gate[i] = stable[i];
         } else {
             gate[i] = 0;   /* phase_inc kept so the release tail keeps its pitch */
         }
@@ -265,6 +288,12 @@ void synth_loop(void)
     if (HAL_UART_Receive(&huart2, &command, 1, 0) == HAL_OK) {
         if (command == 'Q') quantise = 1;
         if (command == 'q') quantise = 0;
+        if (command == 'S') sequence_running = 1;
+        if (command == 's') sequence_running = 0;
+        if (command == '+' && sequence_bpm < 240) sequence_bpm += 5;
+        if (command == '-' && sequence_bpm > 30) sequence_bpm -= 5;
+        if (command >= '1' && command <= '4')
+            sequence_enabled ^= 1u << (command - '1');
     }
 
     if (tx_buf < 0 && ready_buf >= 0) {
@@ -276,7 +305,7 @@ void synth_loop(void)
         tx_buf    = r;
         __enable_irq();
 
-        /* 534 bytes take ~5.8 ms at 921600 baud; a block lasts ~11.6 ms */
+        /* 536 bytes take ~5.8 ms at 921600 baud; a block lasts ~11.6 ms */
         if (HAL_UART_Transmit_DMA(&huart2, (uint8_t *)&frames[r],
                                   sizeof(frame_t)) != HAL_OK) {
             /* not started: hand it back unless a newer frame arrived */

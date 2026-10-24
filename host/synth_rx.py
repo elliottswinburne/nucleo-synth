@@ -5,7 +5,8 @@ synth_rx.py - play the NUCLEO-F446RE synth's audio stream on the PC.
 The Nucleo sends frames over the ST-LINK virtual COM port:
     0xA5 0x5A  +  256 x int16 little-endian mono samples
                +  9 x uint16 raw pot readings  +  uint8 held keys  +  uint8 wave
-    (534 bytes) at 22050 Hz, 921600 baud.
+               + uint8 sequencer state + uint8 tempo
+    (536 bytes) at 22050 Hz, 921600 baud.
 
 Install:  pip install pyserial sounddevice numpy
 Run:      python synth_rx.py                 (auto-detects the ST-LINK port)
@@ -34,7 +35,8 @@ SYNC = b"\xA5\x5A"
 BLOCK = 256                 # samples per frame (must match firmware)
 NPOTS = 9                   # notes 1-4, cutoff, release, attack, decay, sustain
 AUDIO_END = 2 + 2 * BLOCK
-FRAME = AUDIO_END + 2 * NPOTS + 2   # bytes per frame
+POTS_END = AUDIO_END + 2 * NPOTS
+FRAME = POTS_END + 4         # keys, waveform, sequencer state, tempo
 SCOPE_BLOCKS = 32           # audio kept for the scope: 32 x 256 = ~371 ms
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 WAVES = ["SAW", "SQUARE", "TRIANGLE", "SINE"]
@@ -109,11 +111,16 @@ def parse(buf: bytearray, stats: dict, ctrl: dict):
             continue
         blocks.append(np.frombuffer(bytes(buf[2:AUDIO_END]), dtype="<i2")
                       .astype(np.float32) / 32768.0)
-        ctrl["pots"] = np.frombuffer(bytes(buf[AUDIO_END:FRAME - 2]),
+        ctrl["pots"] = np.frombuffer(bytes(buf[AUDIO_END:POTS_END]),
                                      dtype="<u2").tolist()
-        ctrl["keys"] = buf[FRAME - 2]
-        ctrl["wave"] = buf[FRAME - 1] & 3
-        ctrl["quantise"] = bool(buf[FRAME - 1] & 0x80)
+        ctrl["keys"] = buf[POTS_END]
+        ctrl["wave"] = buf[POTS_END + 1] & 3
+        ctrl["quantise"] = bool(buf[POTS_END + 1] & 0x80)
+        sequence = buf[POTS_END + 2]
+        ctrl["enabled"] = sequence & 15
+        ctrl["step"] = (sequence >> 4) & 3
+        ctrl["running"] = bool(sequence & 0x40)
+        ctrl["bpm"] = buf[POTS_END + 3]
         del buf[:FRAME]
     return blocks
 
@@ -169,6 +176,27 @@ def fft_spectrum(x, rate):
     magnitude[1:-1] *= 2
     db = 20 * np.log10(np.maximum(magnitude, 1e-8))
     return frequencies, np.clip(db, -80, 0)
+
+
+def waveform_curve(samples, width):
+    """Shape-preserving cubic interpolation for the displayed trace."""
+    samples = np.asarray(samples, dtype=np.float64)
+    if len(samples) < 3:
+        return np.interp(np.linspace(0, len(samples) - 1, width),
+                         np.arange(len(samples)), samples)
+    delta = np.diff(samples)
+    slopes = np.zeros(len(samples))
+    slopes[0], slopes[-1] = delta[0], delta[-1]
+    # Flatten turning points and keep square/saw edges from overshooting.
+    np.divide(2 * delta[:-1] * delta[1:], delta[:-1] + delta[1:],
+              out=slopes[1:-1], where=delta[:-1] * delta[1:] > 0)
+    position = np.linspace(0, len(samples) - 1, width)
+    index = np.minimum(position.astype(int), len(samples) - 2)
+    t = position - index
+    return ((2 * t**3 - 3 * t**2 + 1) * samples[index]
+            + (t**3 - 2 * t**2 + t) * slopes[index]
+            + (-2 * t**3 + 3 * t**2) * samples[index + 1]
+            + (t**3 - t**2) * slopes[index + 1])
 
 
 # Pot -> parameter mappings. These mirror control_update() in synth_core.c
@@ -229,7 +257,8 @@ def control_labels(ctrl, rate, note_pots=None):
         # Quantised labels use the same raw reading as the firmware.
         p = pots[i] if quantise or note_pots is None else note_pots[i]
         f = pot_pitch(p, quantise)
-        cells.append((f"NOTE {i + 1}", f"{f:.1f} Hz\n{note_name(f)}",
+        label = f"STEP {i + 1}" if ctrl.get("running", False) else f"NOTE {i + 1}"
+        cells.append((label, f"{f:.1f} Hz\n{note_name(f)}",
                       bool(keys >> i & 1)))
     fc = pot_cutoff(pots[4], rate)
     fc_text = ("open" if fc is None else
@@ -262,33 +291,50 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
     panel.pack(side="bottom", fill="x")
     cells = []
     for col in range(NPOTS + 1):
-        panel.columnconfigure(col, weight=1, uniform="cell")
+        grid_col = col if col < 4 else col + 1
+        panel.columnconfigure(grid_col, weight=1, uniform="cell")
         # Keep panel width stable when control values change.
         name = tk.Label(panel, bg="#000000", fg="#666666",
                         font=("Consolas", 9), width=10)
         value = tk.Label(panel, bg="#000000", fg="#888888", justify="center",
                          font=("Consolas", 12), width=10, text="—\n ")
-        name.grid(row=0, column=col, pady=(8, 0))
-        value.grid(row=1, column=col, pady=(2, 10))
+        name.grid(row=0, column=grid_col, pady=(8, 0))
+        value.grid(row=1, column=grid_col, pady=(2, 10))
         cells.append((name, value))
+    divider = tk.Frame(panel, width=1, bg=THEMES[0]["axis"])
+    divider.grid(row=0, column=4, rowspan=2, sticky="ns", padx=8, pady=(12, 14))
 
     canvas = tk.Canvas(root, width=800, height=360, bg="#000000",
                        highlightthickness=0)
     canvas.pack(fill="both", expand=True)
     axis = canvas.create_line(0, 0, 0, 0, fill="#333333", tags="axis")
     trace = canvas.create_line(0, 0, 0, 0, fill="#ffffff", width=2,
-                               tags="trace")
+                               capstyle="round", joinstyle="round", tags="trace")
     pitch = canvas.create_text(16, 12, anchor="nw", fill="#ffffff",
                                font=("Consolas", 22), tags="text")
     info = canvas.create_text(16, 48, anchor="nw", fill="#888888",
                               font=("Consolas", 10), state="hidden",
                               tags="text")
+    sequence_status = canvas.create_text(0, 12, anchor="ne", fill="#888888",
+                                        font=("Consolas", 11), tags="text")
     hint = canvas.create_text(0, 0, anchor="se", fill="#555555",
                               font=("Consolas", 9), text="I - info",
                               tags="text")
     view = {"gain": 1.0, "cycles": 3, "info": False, "theme": 0,
             "grid_size": None, "restack": False, "quantise": False,
-            "fft": False}
+            "fft": False, "running": False}
+
+    def toggle_sequence(e=None):
+        view["running"] = not view["running"]
+        commands.append(b"S" if view["running"] else b"s")
+        return "break"
+
+    root.bind("<space>", toggle_sequence)
+    root.bind("<Key-bracketleft>", lambda e: commands.append(b"-"))
+    root.bind("<Key-bracketright>", lambda e: commands.append(b"+"))
+    for i in range(4):
+        root.bind(f"<Key-{i + 1}>",
+                  lambda e, i=i: commands.append(str(i + 1).encode("ascii")))
 
     # line pools for the beam-speed layers: one item per run of slow trace,
     # created as needed and hidden when unused
@@ -326,7 +372,8 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
         scope_keys = "" if view["fft"] else "↑↓ - gain   ←→ - cycles   R - reset   "
         canvas.itemconfigure(
             hint, text=scope_keys + "T - theme   "
-                       f"F - FFT   Q - quantise: {quantisation}   I - info" if view["info"]
+                       f"F - FFT   Q - quantise: {quantisation}   I - info\n"
+                       "Space - play/stop   [ ] - tempo   1–4 - mute steps" if view["info"]
                        else "I - info")
 
     def toggle_fft(e):
@@ -346,6 +393,7 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
 
     def toggle_info(e):
         view["info"] = not view["info"]
+        view["grid_size"] = None
         canvas.itemconfigure(info, state="normal" if view["info"] else "hidden")
         set_hint()
 
@@ -372,7 +420,7 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
             canvas.create_line(0, h - 1, w, h - 1, fill=t["grid"],
                                width=1, tags="bezel")
         if view["fft"]:
-            top, bottom = 80, max(81, h - 54)
+            top, bottom = 80, max(81, h - (74 if view["info"] else 54))
             left, right = 84, max(85, w - 12)
             for i in range(5):
                 x = left + (right - left) * i / 4
@@ -409,11 +457,12 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
         canvas.configure(bg=t["bg"])
         for widget in (root, panel):
             widget.configure(bg=t["panel"])
+        divider.configure(bg=t["axis"])
         for name, value in cells:
             name.configure(bg=t["panel"], fg=t["label"])
             value.configure(bg=t["panel"], fg=t["value"])
         for item, key in ((axis, "axis"), (trace, "trace"), (pitch, "pitch"),
-                          (info, "info"), (hint, "hint")):
+                          (info, "info"), (hint, "hint"), (sequence_status, "info")):
             canvas.itemconfigure(item, fill=t[key])
         if t["beam"] is None:
             for layer in pools:
@@ -450,13 +499,13 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
                 s = start + up[0]
         y = x[s:s + span]
 
-        ys = np.interp(np.linspace(0, len(y) - 1, w), np.arange(len(y)), y)
+        ys = waveform_curve(y, w)
         pts = np.empty(2 * w)
         pts[0::2] = np.arange(w)
         pts[1::2] = h / 2 - ys * (0.48 * h * view["gain"])  # x1: full scale
         if view["fft"]:
             frequencies, db = fft_spectrum(x, rate)
-            top, bottom = 80, max(81, h - 54)
+            top, bottom = 80, max(81, h - (74 if view["info"] else 54))
             left, right = 84, max(85, w - 12)
             pts = np.empty(2 * len(db))
             pts[0::2] = left + frequencies / (rate / 2) * (right - left)
@@ -490,6 +539,7 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
         canvas.coords(axis, 0, h / 2, w, h / 2)
         canvas.itemconfigure(axis, state="hidden" if view["fft"] else "normal")
         canvas.coords(hint, w - 10, h - 8)
+        canvas.coords(sequence_status, w - 16, 12)
 
         canvas.itemconfigure(
             pitch, text=f"{f:.1f} Hz   {note_name(f)}" if f else "—")
@@ -503,11 +553,19 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
                        f"resyncs {stats['resync']}")
 
         if ctrl:
-            for (name, value), (n, text, active) in zip(
+            running = ctrl.get("running", False)
+            canvas.itemconfigure(sequence_status,
+                                 text=f"SEQ {'playing' if running else 'stopped'} · "
+                                      f"{ctrl.get('bpm', 120)} BPM")
+            for i, ((name, value), (n, text, active)) in enumerate(zip(
                     cells, control_labels(ctrl, rate,
-                                          pitch_display.update(ctrl["pots"]))):
-                name.configure(text=n)
+                                          pitch_display.update(ctrl["pots"])))):
+                muted = i < 4 and not (ctrl.get("enabled", 15) & (1 << i))
+                current = i < 4 and running and ctrl.get("step", 0) == i
+                name.configure(text=n + (" off" if muted else ""),
+                               fg=theme["active"] if current else theme["label"])
                 value.configure(text=text, fg=theme["active"] if active
+                                else theme["label"] if muted and running
                                 else theme["value"])
         set_hint()
         # Keep a 120 Hz schedule independent of redraw cost and timer lateness.
@@ -534,6 +592,7 @@ def run_scope(scope, stats, q, rate, ctrl, commands):
         if winmm.timeBeginPeriod(1) != 0:
             winmm = None
     try:
+        apply_theme()
         update()
         root.mainloop()
     finally:
@@ -600,7 +659,7 @@ def main():
     stats = {"resync": 0, "under": 0, "drop": 0, "frames": 0}
     ctrl = {}                                        # latest control state
     stop = threading.Event()
-    commands = collections.deque([b"q"])  # Start each session in continuous mode.
+    commands = collections.deque([b"q", b"s"])  # Continuous tuning, stopped.
 
     def reader():
         buf = bytearray()
@@ -625,7 +684,8 @@ def main():
             stats["under"] += 1
         scope.append(outdata[:, 0].copy())
 
-    threading.Thread(target=reader, daemon=True).start()
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
 
     while len(q) < args.target:       # prefill
         time.sleep(0.01)
@@ -646,7 +706,11 @@ def main():
         print()
     finally:
         stop.set()
-        ser.close()
+        reader_thread.join(timeout=0.5)
+        try:
+            ser.write(b"s")
+        finally:
+            ser.close()
 
 
 if __name__ == "__main__":
