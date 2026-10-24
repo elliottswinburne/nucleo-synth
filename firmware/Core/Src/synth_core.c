@@ -45,7 +45,12 @@ extern ADC_HandleTypeDef  hadc1;
 typedef struct {
     uint8_t sync[2];   // two unsigned bytes
     int16_t s[BLOCK];
+    uint16_t pots[NPOTS];  /* raw 12-bit ADC readings, for the host display */
+    uint8_t  keys;         /* bit n set = note n+1 button held              */
+    uint8_t  wave;
 } __attribute__((packed)) frame_t;
+
+_Static_assert(sizeof(frame_t) == 528, "Audio frame must match the host protocol");
 
 static frame_t frames[2] = { { {0xA5, 0x5A}, {0} }, { {0xA5, 0x5A}, {0} } };
 static volatile uint8_t  fill_buf  = 0;
@@ -59,11 +64,13 @@ static volatile uint32_t phase_inc[NNOTES];     /* oscillator step, per voice */
 static volatile uint8_t  gate[NNOTES];          /* key held, per voice      */
 static volatile uint8_t  wave         = 0;      /* 0 saw 1 square 2 tri 3 sine */
 static volatile int32_t  lp_k         = 32767;  /* filter coefficient Q15   */
-static volatile int32_t  release_step = 50;     /* env decrement per sample */
+static volatile int32_t  release_step = 50 * 32768; /* Q30 decrement per sample */
 
-#define ATTACK_STEP 300                         /* ~5 ms attack             */
+#define ENV_MAX     (32767 * 32768)             /* Q30, converts to Q15 32767 */
+#define ATTACK_STEP (300 * 32768)               /* ~5 ms attack             */
 
-static uint16_t pots[NPOTS];                    /* ADC DMA target           */
+static volatile uint16_t pots[NPOTS];           /* ADC DMA target           */
+static volatile uint32_t adc_start_failures;    /* failed scans, for debugging */
 static int16_t  sine_lut[256];
 
 /* ---------------- audio: one sample per TIM6 tick ---------------- */
@@ -76,8 +83,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
     int32_t mix = 0;
     for (int v = 0; v < NNOTES; v++) {
-        /* envelope: linear attack / adjustable linear release, Q15 */
-        if (gate[v]) { env[v] += ATTACK_STEP;  if (env[v] > 32767) env[v] = 32767; }
+        /* envelope: linear attack / adjustable linear release, Q30 */
+        if (gate[v]) { env[v] += ATTACK_STEP;  if (env[v] > ENV_MAX) env[v] = ENV_MAX; }
         else         { env[v] -= release_step; if (env[v] < 0)     env[v] = 0;     }
         if (env[v] == 0) continue;             /* silent voice: skip */
 
@@ -92,9 +99,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         default: x = sine_lut[p >> 24];                               break; /* sine   */
         }
 
-        mix += (x * env[v]) >> 15;
+        mix += (x * (env[v] >> 15)) >> 15;      /* Q15 gain keeps product in int32 */
     }
-    mix >>= 2;                                 /* 4 voices at full scale fit */
+    mix /= NNOTES;                             /* all voices at full scale fit */
 
     /* one-pole low-pass, shared by all voices */
     lp += ((mix - lp) * lp_k) >> 15;
@@ -104,6 +111,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     frames[fill_buf].s[fill_idx] = (int16_t)out;
     if (++fill_idx >= BLOCK) {
         fill_idx = 0;
+
+        /* snapshot the controls into the finished frame */
+        frame_t *fr = &frames[fill_buf];
+        for (int i = 0; i < NPOTS; i++) fr->pots[i] = pots[i];
+        uint8_t keys = 0;
+        for (int v = 0; v < NNOTES; v++) keys |= gate[v] << v;
+        fr->keys = keys;
+        fr->wave = wave;
+
         uint8_t next = fill_buf ^ 1;
         if (tx_buf == (int8_t)next) {
             /* DMA still reading the other buffer: no free buffer, so drop
@@ -148,22 +164,29 @@ static void control_update(void)
         }
     }
 
-    /* --- B1 cycles waveform on press --- */
+    /* --- B1 cycles waveform after 20 ms of stable input --- */
     static GPIO_PinState b1_last = GPIO_PIN_SET;
+    static GPIO_PinState b1_stable = GPIO_PIN_SET;
+    static uint32_t b1_changed;
     GPIO_PinState b1 = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
-    if (b1 == GPIO_PIN_RESET && b1_last == GPIO_PIN_SET) wave = (wave + 1) & 3;
-    b1_last = b1;
+    uint32_t now = HAL_GetTick();
+    if (b1 != b1_last) { b1_last = b1; b1_changed = now; }
+    if (b1 != b1_stable && now - b1_changed >= 20) {
+        b1_stable = b1;
+        if (b1 == GPIO_PIN_RESET) wave = (wave + 1) & 3;
+    }
 
     /* --- cutoff: coefficient 1/128 .. 1, exponential --- */
     lp_k = (int32_t)(32767.0f * exp2f((pots[4] / 4095.0f - 1.0f) * 7.0f));
 
     /* --- release: 10 ms .. ~2 s, exponential --- */
     float t_rel = 0.01f * exp2f(pots[5] * (7.6f / 4095.0f));
-    int32_t step = (int32_t)(32767.0f / (t_rel * FS));
+    int32_t step = (int32_t)((float)ENV_MAX / (t_rel * FS));
     release_step = step < 1 ? 1 : step;
 
     /* --- start the next pot scan; results are used next update --- */
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t *)pots, NPOTS);
+    if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)pots, NPOTS) != HAL_OK)
+        adc_start_failures++;
 }
 
 void synth_init(void)
@@ -171,7 +194,8 @@ void synth_init(void)
     for (int i = 0; i < 256; i++)
         sine_lut[i] = (int16_t)(32767.0f * sinf(i * (6.2831853f / 256.0f)));
 
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t *)pots, NPOTS);
+    if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)pots, NPOTS) != HAL_OK)
+        adc_start_failures++;
     HAL_TIM_Base_Start_IT(&htim6);
 }
 
@@ -186,7 +210,7 @@ void synth_loop(void)
         tx_buf    = r;
         __enable_irq();
 
-        /* 514 bytes take ~5.6 ms at 921600 baud; a block lasts ~11.6 ms */
+        /* 528 bytes take ~5.7 ms at 921600 baud; a block lasts ~11.6 ms */
         if (HAL_UART_Transmit_DMA(&huart2, (uint8_t *)&frames[r],
                                   sizeof(frame_t)) != HAL_OK) {
             /* not started: hand it back unless a newer frame arrived */

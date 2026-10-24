@@ -3,8 +3,9 @@
 synth_rx.py - play the NUCLEO-F446RE synth's audio stream on the PC.
 
 The Nucleo sends frames over the ST-LINK virtual COM port:
-    0xA5 0x5A  +  256 x int16 little-endian mono samples   (514 bytes)
-at 22050 Hz, 921600 baud.
+    0xA5 0x5A  +  256 x int16 little-endian mono samples
+               +  6 x uint16 raw pot readings  +  uint8 held keys  +  uint8 wave
+    (528 bytes) at 22050 Hz, 921600 baud.
 
 Install:  pip install pyserial sounddevice numpy
 Run:      python synth_rx.py                 (auto-detects the ST-LINK port)
@@ -31,16 +32,20 @@ import sounddevice as sd
 
 SYNC = b"\xA5\x5A"
 BLOCK = 256                 # samples per frame (must match firmware)
-FRAME = 2 + 2 * BLOCK       # bytes per frame
+NPOTS = 6                   # pots: notes 1-4, cutoff, release
+AUDIO_END = 2 + 2 * BLOCK
+FRAME = AUDIO_END + 2 * NPOTS + 2   # bytes per frame
 SCOPE_BLOCKS = 32           # audio kept for the scope: 32 x 256 = ~371 ms
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+WAVES = ["SAW", "SQUARE", "TRIANGLE", "SINE"]
 
 
-def parse(buf: bytearray, stats: dict):
+def parse(buf: bytearray, stats: dict, ctrl: dict):
     """Pull complete, validated frames out of buf (modified in place).
 
     A frame is accepted only if the *next* frame's sync word follows it,
     so a 0xA5 0x5A pair occurring inside audio data cannot desync us.
+    The latest control state is stored in ctrl.
     """
     blocks = []
     while True:
@@ -57,8 +62,11 @@ def parse(buf: bytearray, stats: dict):
             del buf[:1]             # false sync inside audio, keep scanning
             stats["resync"] += 1
             continue
-        blocks.append(np.frombuffer(bytes(buf[2:FRAME]), dtype="<i2")
+        blocks.append(np.frombuffer(bytes(buf[2:AUDIO_END]), dtype="<i2")
                       .astype(np.float32) / 32768.0)
+        ctrl["pots"] = np.frombuffer(bytes(buf[AUDIO_END:FRAME - 2]),
+                                     dtype="<u2").tolist()
+        ctrl["keys"], ctrl["wave"] = buf[FRAME - 2], buf[FRAME - 1]
         del buf[:FRAME]
     return blocks
 
@@ -102,13 +110,65 @@ def note_name(f):
     return f"{NOTE_NAMES[m % 12]}{m // 12 - 1} {100 * (midi - m):+.0f}¢"
 
 
-def run_scope(scope, stats, q, rate):
-    """Oscilloscope window: triggered waveform + detected pitch. Blocks."""
+# Pot -> parameter mappings. These mirror control_update() in synth_core.c
+# and must be kept in step with it.
+def pot_pitch(p):
+    return 55.0 * 2 ** (p * 4.0 / 4095.0)
+
+
+def pot_cutoff(p, rate):
+    """One-pole low-pass corner in Hz, or None when the filter is wide open."""
+    k = int(32767.0 * 2 ** ((p / 4095.0 - 1.0) * 7.0)) / 32768.0
+    fc = -rate * np.log(1.0 - k) / (2 * np.pi)
+    return fc if fc < rate / 2 else None
+
+
+def pot_release(p):
+    return 0.01 * 2 ** (p * 7.6 / 4095.0)
+
+
+def control_labels(ctrl, rate):
+    """[(name, value text, active)] for the control panel."""
+    pots, keys = ctrl["pots"], ctrl["keys"]
+    cells = []
+    for i in range(4):
+        f = pot_pitch(pots[i])
+        cells.append((f"NOTE {i + 1}", f"{f:.1f} Hz\n{note_name(f)}",
+                      bool(keys >> i & 1)))
+    fc = pot_cutoff(pots[4], rate)
+    fc_text = ("open" if fc is None else
+               f"{fc / 1000:.2f} kHz" if fc >= 1000 else f"{fc:.0f} Hz")
+    cells.append(("CUTOFF", f"{fc_text}\n{100 * pots[4] / 4095:.0f}%", False))
+    t = pot_release(pots[5])
+    t_text = f"{t:.2f} s" if t >= 1 else f"{1000 * t:.0f} ms"
+    cells.append(("RELEASE", f"{t_text}\n{100 * pots[5] / 4095:.0f}%", False))
+    cells.append(("WAVE", f"{WAVES[ctrl['wave'] & 3]}\n ", False))
+    return cells
+
+
+def run_scope(scope, stats, q, rate, ctrl):
+    """Oscilloscope window: triggered waveform + detected pitch, and a panel
+    showing each control's current value. Blocks."""
     import tkinter as tk
     import traceback
 
     root = tk.Tk()
     root.title("synth scope")
+
+    # control panel along the bottom: one cell per pot, plus the waveform
+    panel = tk.Frame(root, bg="#111111")
+    panel.pack(side="bottom", fill="x")
+    cells = []
+    for col in range(7):
+        panel.columnconfigure(col, weight=1, uniform="cell")
+        name = tk.Label(panel, bg="#111111", fg="#666666",
+                        font=("Consolas", 9))
+        value = tk.Label(panel, bg="#111111", fg="#888888", justify="center",
+                         font=("Consolas", 12, "bold"), text="—\n ")
+        name.grid(row=0, column=col, pady=(8, 0))
+        value.grid(row=1, column=col, pady=(2, 10))
+        cells.append((name, value))
+
     canvas = tk.Canvas(root, width=800, height=360, bg="#000000",
                        highlightthickness=0)
     canvas.pack(fill="both", expand=True)
@@ -171,6 +231,13 @@ def run_scope(scope, stats, q, rate):
                        f"frames {stats['frames']}  buffered {len(q)}  "
                        f"underruns {stats['under']}  drops {stats['drop']}  "
                        f"resyncs {stats['resync']}")
+
+        if ctrl:
+            for (name, value), (n, text, active) in zip(
+                    cells, control_labels(ctrl, rate)):
+                name.configure(text=n)
+                value.configure(text=text,
+                                fg="#ffffff" if active else "#888888")
         root.after(33, update)                         # ~30 fps
 
     def on_error(exc, val, tb):                        # let Ctrl+C quit
@@ -241,13 +308,14 @@ def main():
     q = collections.deque()
     scope = collections.deque(maxlen=SCOPE_BLOCKS)   # recently played audio
     stats = {"resync": 0, "under": 0, "drop": 0, "frames": 0}
+    ctrl = {}                                        # latest control state
     stop = threading.Event()
 
     def reader():
         buf = bytearray()
         while not stop.is_set():
             buf += ser.read(4096)
-            for b in parse(buf, stats):
+            for b in parse(buf, stats, ctrl):
                 q.append(b)
                 stats["frames"] += 1
 
@@ -274,7 +342,7 @@ def main():
                              channels=1, dtype="float32", latency="low",
                              blocksize=BLOCK, callback=callback):
             if not args.no_scope:
-                run_scope(scope, stats, q, args.rate)
+                run_scope(scope, stats, q, args.rate, ctrl)
                 return
             while True:
                 time.sleep(1)
