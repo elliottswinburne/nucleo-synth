@@ -12,13 +12,16 @@
  * TIM6    : Prescaler 0, Counter Period 4081  -> 90 MHz/4082 = ~22.05 kHz.
  *           TIM6 global interrupt on.
  * ADC1    : Scan ON, Continuous OFF, DMA Continuous Requests OFF,
- *           6 conversions, sampling time 480 cycles each, ranks in order:
+ *           9 conversions, sampling time 480 cycles each, ranks in order:
  *             1 IN0  (PA0, A0)  pitch note 1
  *             2 IN1  (PA1, A1)  pitch note 2
  *             3 IN4  (PA4, A2)  pitch note 3
  *             4 IN8  (PB0, A3)  pitch note 4
  *             5 IN11 (PC1, A4)  filter cutoff
  *             6 IN10 (PC0, A5)  release time
+ *             7 IN12 (PC2, CN7-35) attack time
+ *             8 IN13 (PC3, CN7-37) decay time
+ *             9 IN14 (PC4, CN10-34) sustain level
  *           DMA: ADC1 (DMA2 Stream0), Normal, half-word.
  * GPIO    : PB5 (D4), PB4 (D5), PB10 (D6), PA8 (D7) = GPIO_Input, Pull-up.
  *           PC13 (blue B1) = GPIO_Input (board has its own pull-up).
@@ -38,7 +41,7 @@ extern ADC_HandleTypeDef  hadc1;
 
 #define FS      22050.0f
 #define BLOCK   256
-#define NPOTS   6
+#define NPOTS   9
 #define NNOTES  4
 
 /* ---------------- audio frames (double buffered) ---------------- */
@@ -50,7 +53,7 @@ typedef struct {
     uint8_t  wave;
 } __attribute__((packed)) frame_t;
 
-_Static_assert(sizeof(frame_t) == 528, "Audio frame must match the host protocol");
+_Static_assert(sizeof(frame_t) == 534, "Audio frame must match the host protocol");
 
 static frame_t frames[2] = { { {0xA5, 0x5A}, {0} }, { {0xA5, 0x5A}, {0} } };
 static volatile uint8_t  fill_buf  = 0;
@@ -64,10 +67,60 @@ static volatile uint32_t phase_inc[NNOTES];     /* oscillator step, per voice */
 static volatile uint8_t  gate[NNOTES];          /* key held, per voice      */
 static volatile uint8_t  wave         = 0;      /* 0 saw 1 square 2 tri 3 sine */
 static volatile int32_t  lp_k         = 32767;  /* filter coefficient Q15   */
-static volatile int32_t  release_step = 50 * 32768; /* Q30 decrement per sample */
 
 #define ENV_MAX     (32767 * 32768)             /* Q30, converts to Q15 32767 */
-#define ATTACK_STEP (300 * 32768)               /* ~5 ms attack             */
+
+static volatile int32_t attack_step = 300 * 32768;
+static volatile int32_t decay_samples = 2205;
+static volatile int32_t release_samples = 2205;
+static volatile int32_t sustain_level = ENV_MAX;
+
+typedef enum { ENV_IDLE, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE } env_stage_t;
+typedef struct {
+    int32_t level, step;
+    env_stage_t stage;
+    uint8_t held;
+} envelope_t;
+
+/* Linear Q30 ADSR. A new press attacks from the current level, even in release.
+   Decay/release durations are captured when those stages begin. */
+static int32_t envelope_tick(envelope_t *env, uint8_t held)
+{
+    if (held && !env->held) env->stage = ENV_ATTACK;
+    if (!held && env->held) {
+        env->stage = ENV_RELEASE;
+        env->step = (env->level + release_samples - 1) / release_samples;
+    }
+    env->held = held;
+
+    switch (env->stage) {
+    case ENV_ATTACK:
+        env->level += attack_step;
+        if (env->level >= ENV_MAX) {
+            env->level = ENV_MAX;
+            env->stage = ENV_DECAY;
+            env->step = (ENV_MAX - sustain_level + decay_samples - 1) / decay_samples;
+            if (env->step < 1) env->step = 1;
+        }
+        break;
+    case ENV_DECAY:
+        env->level -= env->step;
+        if (env->level <= sustain_level) {
+            env->level = sustain_level;
+            env->stage = ENV_SUSTAIN;
+        }
+        break;
+    case ENV_SUSTAIN:
+        env->level = sustain_level;
+        break;
+    case ENV_RELEASE:
+        env->level -= env->step;
+        if (env->level <= 0) { env->level = 0; env->stage = ENV_IDLE; }
+        break;
+    default: break;
+    }
+    return env->level;
+}
 
 static volatile uint16_t pots[NPOTS];           /* ADC DMA target           */
 static volatile uint32_t adc_start_failures;    /* failed scans, for debugging */
@@ -79,14 +132,13 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     if (htim->Instance != TIM6) return;
 
     static uint32_t phase[NNOTES];
-    static int32_t  env[NNOTES], lp = 0;
+    static envelope_t env[NNOTES];
+    static int32_t lp = 0;
 
     int32_t mix = 0;
     for (int v = 0; v < NNOTES; v++) {
-        /* envelope: linear attack / adjustable linear release, Q30 */
-        if (gate[v]) { env[v] += ATTACK_STEP;  if (env[v] > ENV_MAX) env[v] = ENV_MAX; }
-        else         { env[v] -= release_step; if (env[v] < 0)     env[v] = 0;     }
-        if (env[v] == 0) continue;             /* silent voice: skip */
+        int32_t level = envelope_tick(&env[v], gate[v]);
+        if (level == 0) continue;             /* silent voice: skip */
 
         uint32_t p = phase[v] += phase_inc[v];
 
@@ -99,7 +151,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         default: x = sine_lut[p >> 24];                               break; /* sine   */
         }
 
-        mix += (x * (env[v] >> 15)) >> 15;      /* Q15 gain keeps product in int32 */
+        mix += (x * (level >> 15)) >> 15;       /* Q15 gain keeps product in int32 */
     }
     mix /= NNOTES;                             /* all voices at full scale fit */
 
@@ -179,10 +231,14 @@ static void control_update(void)
     /* --- cutoff: coefficient 1/128 .. 1, exponential --- */
     lp_k = (int32_t)(32767.0f * exp2f((pots[4] / 4095.0f - 1.0f) * 7.0f));
 
-    /* --- release: 10 ms .. ~2 s, exponential --- */
+    /* --- ADSR: attack/decay 2 ms .. 2 s; release 10 ms .. ~2 s --- */
     float t_rel = 0.01f * exp2f(pots[5] * (7.6f / 4095.0f));
-    int32_t step = (int32_t)((float)ENV_MAX / (t_rel * FS));
-    release_step = step < 1 ? 1 : step;
+    float t_attack = 0.002f * exp2f(pots[6] * (9.965784f / 4095.0f));
+    float t_decay = 0.002f * exp2f(pots[7] * (9.965784f / 4095.0f));
+    attack_step = (int32_t)((float)ENV_MAX / (t_attack * FS));
+    decay_samples = (int32_t)(t_decay * FS + 0.5f);
+    release_samples = (int32_t)(t_rel * FS + 0.5f);
+    sustain_level = (int32_t)((int64_t)pots[8] * ENV_MAX / 4095);
 
     /* --- start the next pot scan; results are used next update --- */
     if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)pots, NPOTS) != HAL_OK)
@@ -210,7 +266,7 @@ void synth_loop(void)
         tx_buf    = r;
         __enable_irq();
 
-        /* 528 bytes take ~5.7 ms at 921600 baud; a block lasts ~11.6 ms */
+        /* 534 bytes take ~5.8 ms at 921600 baud; a block lasts ~11.6 ms */
         if (HAL_UART_Transmit_DMA(&huart2, (uint8_t *)&frames[r],
                                   sizeof(frame_t)) != HAL_OK) {
             /* not started: hand it back unless a newer frame arrived */

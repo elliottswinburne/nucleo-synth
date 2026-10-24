@@ -4,8 +4,8 @@ synth_rx.py - play the NUCLEO-F446RE synth's audio stream on the PC.
 
 The Nucleo sends frames over the ST-LINK virtual COM port:
     0xA5 0x5A  +  256 x int16 little-endian mono samples
-               +  6 x uint16 raw pot readings  +  uint8 held keys  +  uint8 wave
-    (528 bytes) at 22050 Hz, 921600 baud.
+               +  9 x uint16 raw pot readings  +  uint8 held keys  +  uint8 wave
+    (534 bytes) at 22050 Hz, 921600 baud.
 
 Install:  pip install pyserial sounddevice numpy
 Run:      python synth_rx.py                 (auto-detects the ST-LINK port)
@@ -32,7 +32,7 @@ import sounddevice as sd
 
 SYNC = b"\xA5\x5A"
 BLOCK = 256                 # samples per frame (must match firmware)
-NPOTS = 6                   # pots: notes 1-4, cutoff, release
+NPOTS = 9                   # notes 1-4, cutoff, release, attack, decay, sustain
 AUDIO_END = 2 + 2 * BLOCK
 FRAME = AUDIO_END + 2 * NPOTS + 2   # bytes per frame
 SCOPE_BLOCKS = 32           # audio kept for the scope: 32 x 256 = ~371 ms
@@ -172,21 +172,57 @@ def pot_release(p):
     return 0.01 * 2 ** (p * 7.6 / 4095.0)
 
 
-def control_labels(ctrl, rate):
+def pot_envelope_time(p):
+    return 0.002 * 2 ** (p * 9.965784 / 4095.0)
+
+
+class PitchDisplay:
+    """Reject pot noise for labels without changing the synth's tuning."""
+
+    def __init__(self):
+        self.history = collections.deque(maxlen=7)
+        self.source = None
+        self.pots = None
+
+    def update(self, pots):
+        # The receiver replaces this list for each frame. Don't count repeated
+        # redraws of the same frame as additional measurements.
+        if pots is self.source:
+            return self.pots
+        self.source = pots
+        self.history.append(pots[:4])
+        median = np.median(self.history, axis=0)
+        if self.pots is None:
+            self.pots = median.tolist()
+        else:
+            for i, reading in enumerate(median):
+                # Four ADC counts are about five cents across the pitch range.
+                if abs(reading - self.pots[i]) > 4:
+                    self.pots[i] = float(reading)
+        return self.pots
+
+
+def control_labels(ctrl, rate, note_pots=None):
     """[(name, value text, active)] for the control panel."""
     pots, keys = ctrl["pots"], ctrl["keys"]
     cells = []
     for i in range(4):
-        f = pot_pitch(pots[i])
+        f = pot_pitch(pots[i] if note_pots is None else note_pots[i])
         cells.append((f"NOTE {i + 1}", f"{f:.1f} Hz\n{note_name(f)}",
                       bool(keys >> i & 1)))
     fc = pot_cutoff(pots[4], rate)
     fc_text = ("open" if fc is None else
                f"{fc / 1000:.2f} kHz" if fc >= 1000 else f"{fc:.0f} Hz")
     cells.append(("CUTOFF", f"{fc_text}\n{100 * pots[4] / 4095:.0f}%", False))
-    t = pot_release(pots[5])
-    t_text = f"{t:.2f} s" if t >= 1 else f"{1000 * t:.0f} ms"
-    cells.append(("RELEASE", f"{t_text}\n{100 * pots[5] / 4095:.0f}%", False))
+    for name, index in (("ATTACK", 6), ("DECAY", 7), ("SUSTAIN", 8), ("RELEASE", 5)):
+        percent = 100 * pots[index] / 4095
+        if name == "SUSTAIN":
+            text = f"{percent:.0f}%\nlevel"
+        else:
+            t = pot_release(pots[index]) if index == 5 else pot_envelope_time(pots[index])
+            t_text = f"{t:.2f} s" if t >= 1 else f"{1000 * t:.0f} ms"
+            text = f"{t_text}\n{percent:.0f}%"
+        cells.append((name, text, False))
     cells.append(("WAVE", f"{WAVES[ctrl['wave'] & 3]}\n ", False))
     return cells
 
@@ -204,7 +240,7 @@ def run_scope(scope, stats, q, rate, ctrl):
     panel = tk.Frame(root, bg="#000000")
     panel.pack(side="bottom", fill="x")
     cells = []
-    for col in range(7):
+    for col in range(NPOTS + 1):
         panel.columnconfigure(col, weight=1, uniform="cell")
         name = tk.Label(panel, bg="#000000", fg="#666666",
                         font=("Consolas", 9))
@@ -332,6 +368,7 @@ def run_scope(scope, stats, q, rate, ctrl):
 
     redraw_interval = 1.0 / 120.0
     next_redraw = time.perf_counter()
+    pitch_display = PitchDisplay()
 
     def update():
         nonlocal next_redraw
@@ -397,7 +434,8 @@ def run_scope(scope, stats, q, rate, ctrl):
 
         if ctrl:
             for (name, value), (n, text, active) in zip(
-                    cells, control_labels(ctrl, rate)):
+                    cells, control_labels(ctrl, rate,
+                                          pitch_display.update(ctrl["pots"]))):
                 name.configure(text=n)
                 value.configure(text=text, fg=theme["active"] if active
                                 else theme["value"])
